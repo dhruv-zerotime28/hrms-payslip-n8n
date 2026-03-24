@@ -44,6 +44,43 @@ const REQUIRED_COLUMNS = [
 const SALARY_SHEET_KEYWORDS = ["salary", "sal", "payroll", "wages"];
 const MAX_FILE_SIZE_MB = 5;
 
+const MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+function extractMonthYear(filename: string): { month: string; year: string } {
+  const base = filename.replace(/\.[^.]+$/, "").replace(/[_\-]+/g, " ");
+  let month = "";
+  let year = "";
+  for (const m of MONTHS) {
+    if (base.toLowerCase().includes(m.toLowerCase())) {
+      month = m;
+      break;
+    }
+    const short = m.slice(0, 3);
+    // match short month as a whole word
+    const shortRe = new RegExp(`\\b${short}\\b`, "i");
+    if (shortRe.test(base)) {
+      month = m;
+      break;
+    }
+  }
+  const yearMatch = base.match(/\b(20\d{2})\b/);
+  if (yearMatch) year = yearMatch[1];
+  return { month, year };
+}
+
 type SheetRow = Record<string, string | number | undefined>;
 
 function formatBytes(bytes: number): string {
@@ -67,6 +104,10 @@ export default function SalarySlipForm() {
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState("");
   const [success, setSuccess] = useState("");
+  const [month, setMonth] = useState("");
+  const [year, setYear] = useState("");
+  const [monthAutoDetected, setMonthAutoDetected] = useState(false);
+  const [yearAutoDetected, setYearAutoDetected] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   /* ── Validation ─────────────────────────────────────── */
@@ -154,6 +195,25 @@ export default function SalarySlipForm() {
 
       setFile(selectedFile);
 
+      // Try to extract month & year from filename
+      const { month: extractedMonth, year: extractedYear } = extractMonthYear(
+        selectedFile.name,
+      );
+      if (extractedMonth) {
+        setMonth(extractedMonth);
+        setMonthAutoDetected(true);
+      } else {
+        setMonth("");
+        setMonthAutoDetected(false);
+      }
+      if (extractedYear) {
+        setYear(extractedYear);
+        setYearAutoDetected(true);
+      } else {
+        setYear("");
+        setYearAutoDetected(false);
+      }
+
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
@@ -209,6 +269,10 @@ export default function SalarySlipForm() {
     setErrors([]);
     setSuccess("");
     setProgress("");
+    setMonth("");
+    setYear("");
+    setMonthAutoDetected(false);
+    setYearAutoDetected(false);
   }, []);
 
   /* ── Submit (calls our own API route, NOT the webhook) ─ */
@@ -222,14 +286,18 @@ export default function SalarySlipForm() {
     setProgress("Sending to server...");
 
     try {
-      const response = await fetch("/api/generate-salary-slip", {
-        method: "POST",
-        body: file,
-        headers: {
-          "Content-Type":
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      const params = new URLSearchParams({ month, year });
+      const response = await fetch(
+        `/api/generate-salary-slip?${params.toString()}`,
+        {
+          method: "POST",
+          body: file,
+          headers: {
+            "Content-Type":
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          },
         },
-      });
+      );
 
       if (!response.ok) {
         const body = await response.json().catch(() => null);
@@ -247,6 +315,10 @@ export default function SalarySlipForm() {
       setSheetNames([]);
       setSheetData([]);
       setColumns([]);
+      setMonth("");
+      setYear("");
+      setMonthAutoDetected(false);
+      setYearAutoDetected(false);
     } catch (err) {
       console.error(err);
       setErrors([
@@ -258,9 +330,9 @@ export default function SalarySlipForm() {
       setLoading(false);
       setProgress("");
     }
-  }, [file]);
+  }, [file, month, year]);
 
-  const canSubmit = file && errors.length === 0 && !loading;
+  const canSubmit = file && errors.length === 0 && !loading && month && year;
 
   /* ── Render ─────────────────────────────────────────── */
 
@@ -353,6 +425,59 @@ export default function SalarySlipForm() {
           >
             ✕
           </button>
+        </div>
+      )}
+
+      {/* Month & Year */}
+      {file && (
+        <div className="mt-4 flex gap-4 max-sm:flex-col max-sm:gap-3">
+          <div className="flex-1">
+            <label className="block text-sm font-semibold text-text-h mb-1.5">
+              Month
+              {monthAutoDetected && (
+                <span className="ml-1.5 text-xs font-normal text-accent">
+                  (auto-detected)
+                </span>
+              )}
+            </label>
+            <select
+              value={month}
+              onChange={(e) => {
+                setMonth(e.target.value);
+                setMonthAutoDetected(false);
+              }}
+              className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm text-text-h transition-colors focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent-bg"
+            >
+              <option value="">Select month</option>
+              {MONTHS.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex-1">
+            <label className="block text-sm font-semibold text-text-h mb-1.5">
+              Year
+              {yearAutoDetected && (
+                <span className="ml-1.5 text-xs font-normal text-accent">
+                  (auto-detected)
+                </span>
+              )}
+            </label>
+            <input
+              type="number"
+              min="2020"
+              max="2099"
+              value={year}
+              onChange={(e) => {
+                setYear(e.target.value);
+                setYearAutoDetected(false);
+              }}
+              placeholder="e.g. 2026"
+              className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm text-text-h transition-colors focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent-bg"
+            />
+          </div>
         </div>
       )}
 

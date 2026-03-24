@@ -24,6 +24,17 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const { searchParams } = new URL(request.url);
+  const month = searchParams.get("month");
+  const year = searchParams.get("year");
+
+  if (!month || !year) {
+    return NextResponse.json(
+      { error: "month and year query parameters are required" },
+      { status: 400 },
+    );
+  }
+
   const body = await request.arrayBuffer();
 
   const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
@@ -34,7 +45,11 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const webhookResponse = await fetch(WEBHOOK_URL, {
+  const webhookUrl = new URL(WEBHOOK_URL);
+  webhookUrl.searchParams.set("month", month);
+  webhookUrl.searchParams.set("year", year);
+
+  const webhookResponse = await fetch(webhookUrl.toString(), {
     method: "POST",
     headers: {
       SalarySlipGenerate: WEBHOOK_SECRET,
