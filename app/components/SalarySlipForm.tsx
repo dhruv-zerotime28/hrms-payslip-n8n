@@ -4,6 +4,7 @@ import {
   useState,
   useRef,
   useCallback,
+  useMemo,
   type DragEvent,
   type ChangeEvent,
 } from "react";
@@ -39,10 +40,14 @@ const REQUIRED_COLUMNS = [
   "Branch",
   "Bank A/c No.",
   "IFSC CODE",
+  "Emp Mail",
 ];
 
 const SALARY_SHEET_KEYWORDS = ["salary", "sal", "payroll", "wages"];
 const MAX_FILE_SIZE_MB = 5;
+const MAX_HEADER_SCAN_ROWS = 15;
+const MIN_HEADER_MATCH_COUNT = 5;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const MONTHS = [
   "January",
@@ -57,31 +62,80 @@ const MONTHS = [
   "October",
   "November",
   "December",
-];
+] as const;
 
-function extractMonthYear(filename: string): { month: string; year: string } {
-  const base = filename.replace(/\.[^.]+$/, "").replace(/[_\-]+/g, " ");
+function extractMonthYearFromCells(cells: string[]): {
+  month: string;
+  year: string;
+} {
   let month = "";
   let year = "";
-  for (const m of MONTHS) {
-    if (base.toLowerCase().includes(m.toLowerCase())) {
-      month = m;
-      break;
+
+  for (const raw of cells) {
+    let cell = String(raw ?? "").trim();
+    if (!cell) continue;
+
+    // If the value looks like a pure number, it might be an Excel date serial
+    const num = Number(cell);
+    if (!isNaN(num) && num > 40000 && num < 60000) {
+      // Convert Excel serial to JS Date (Excel epoch: 1899-12-30)
+      const date = new Date((num - 25569) * 86400000);
+      if (!isNaN(date.getTime())) {
+        const m = MONTHS[date.getUTCMonth()];
+        const y = String(date.getUTCFullYear());
+        if (m) month = m;
+        if (y.startsWith("20")) year = y;
+        if (month && year) break;
+        continue;
+      }
     }
-    const short = m.slice(0, 3);
-    // match short month as a whole word
-    const shortRe = new RegExp(`\\b${short}\\b`, "i");
-    if (shortRe.test(base)) {
-      month = m;
-      break;
+
+    // Try full month name first ("January 2026")
+    for (const m of MONTHS) {
+      if (cell.toLowerCase().includes(m.toLowerCase())) {
+        month = m;
+        break;
+      }
     }
+    // Try short month name ("Feb-26", "Mar 2026")
+    if (!month) {
+      for (const m of MONTHS) {
+        const short = m.slice(0, 3);
+        const re = new RegExp(`\\b${short}\\b`, "i");
+        if (re.test(cell)) {
+          month = m;
+          break;
+        }
+      }
+    }
+    // Try numeric month ("02/2026", "02-2026")
+    if (!month) {
+      const numericMatch = cell.match(/\b(0?[1-9]|1[0-2])[\s/\-](20\d{2})\b/);
+      if (numericMatch) {
+        month = MONTHS[parseInt(numericMatch[1], 10) - 1];
+        year = numericMatch[2];
+      }
+    }
+
+    // Extract 4-digit year
+    if (!year) {
+      const y4 = cell.match(/\b(20\d{2})\b/);
+      if (y4) year = y4[1];
+    }
+    // Extract 2-digit year from patterns like "Feb-26"
+    if (!year) {
+      const y2 = cell.match(/[\-/](\d{2})\b/);
+      if (y2) year = "20" + y2[1];
+    }
+
+    if (month && year) break;
   }
-  const yearMatch = base.match(/\b(20\d{2})\b/);
-  if (yearMatch) year = yearMatch[1];
+
   return { month, year };
 }
 
 type SheetRow = Record<string, string | number | undefined>;
+type RawRow = (string | number | undefined)[];
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return bytes + " B";
@@ -93,10 +147,82 @@ function normalizeCol(s: string): string {
   return s.replace(/\s+/g, "").toLowerCase();
 }
 
+function findCol(cols: string[], ...targets: string[]) {
+  return cols.find((c) => targets.includes(normalizeCol(c)));
+}
+
+function detectHeaderRow(rawData: RawRow[]): number {
+  for (let i = 0; i < Math.min(rawData.length, MAX_HEADER_SCAN_ROWS); i++) {
+    const row = (rawData[i] || []).map((c) => String(c ?? ""));
+    const matches = REQUIRED_COLUMNS.filter((rc) =>
+      row.some((cell) => normalizeCol(cell) === normalizeCol(rc)),
+    );
+    if (matches.length >= MIN_HEADER_MATCH_COUNT) return i;
+  }
+  return -1;
+}
+
+function collectMetadataCells(
+  rawData: RawRow[],
+  formattedData: RawRow[],
+  headerRowIndex: number,
+): string[] {
+  const cells: string[] = [];
+  for (let i = 0; i < headerRowIndex; i++) {
+    const rawRow = rawData[i] || [];
+    const fmtRow = formattedData[i] || [];
+    for (let j = 0; j < Math.max(rawRow.length, fmtRow.length); j++) {
+      const fmtVal = fmtRow[j];
+      if (fmtVal != null && String(fmtVal).trim()) cells.push(String(fmtVal));
+      const rawVal = rawRow[j];
+      if (rawVal != null && typeof rawVal === "number")
+        cells.push(String(rawVal));
+    }
+  }
+  return cells;
+}
+
+function validateRows(
+  jsonData: SheetRow[],
+  fileColumns: string[],
+  headerRowIndex: number,
+): string[] {
+  const issues: string[] = [];
+  const nameKey = findCol(fileColumns, "name");
+  const srNoKey = findCol(fileColumns, "sr.no.", "srno", "sr.no");
+  const emailKey = findCol(fileColumns, "empmail");
+
+  for (let idx = 0; idx < jsonData.length; idx++) {
+    const row = jsonData[idx];
+    const empName = nameKey ? String(row[nameKey] ?? "").trim() : "";
+    const empSrNo = srNoKey ? String(row[srNoKey] ?? "").trim() : "";
+    const empLabel = empName
+      ? `${empName}${empSrNo ? ` (Sr. No. ${empSrNo})` : ""}`
+      : `Row ${headerRowIndex + idx + 2}`;
+
+    const missing = REQUIRED_COLUMNS.filter((col) => {
+      const key = fileColumns.find(
+        (fc) => normalizeCol(fc) === normalizeCol(col),
+      );
+      return key && (row[key] === undefined || row[key] === "");
+    });
+    if (missing.length > 0) {
+      issues.push(`${empLabel}: missing ${missing.join(", ")}`);
+    }
+
+    if (emailKey) {
+      const email = String(row[emailKey] ?? "").trim();
+      if (email && !EMAIL_RE.test(email)) {
+        issues.push(`${empLabel}: invalid email "${email}"`);
+      }
+    }
+  }
+  return issues;
+}
+
 export default function SalarySlipForm() {
   const [file, setFile] = useState<File | null>(null);
-  const [, setWorkbook] = useState<XLSX.WorkBook | null>(null);
-  const [sheetNames, setSheetNames] = useState<string[]>([]);
+  const [sheetCount, setSheetCount] = useState(0);
   const [sheetData, setSheetData] = useState<SheetRow[]>([]);
   const [columns, setColumns] = useState<string[]>([]);
   const [errors, setErrors] = useState<string[]>([]);
@@ -106,17 +232,72 @@ export default function SalarySlipForm() {
   const [success, setSuccess] = useState("");
   const [month, setMonth] = useState("");
   const [year, setYear] = useState("");
-  const [monthAutoDetected, setMonthAutoDetected] = useState(false);
-  const [yearAutoDetected, setYearAutoDetected] = useState(false);
+  const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sendMail, setSendMail] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  /* ── Reset all state ────────────────────────────────── */
+
+  const resetState = useCallback(() => {
+    setFile(null);
+    setSheetCount(0);
+    setSheetData([]);
+    setColumns([]);
+    setErrors([]);
+    setSuccess("");
+    setProgress("");
+    setMonth("");
+    setYear("");
+    setSelectedRows(new Set());
+    setSearchQuery("");
+    setSendMail(false);
+  }, []);
 
   /* ── Validation ─────────────────────────────────────── */
 
   const validateSheet = useCallback((wb: XLSX.WorkBook, sheetName: string) => {
-    const validationErrors: string[] = [];
     const worksheet = wb.Sheets[sheetName];
-    const jsonData = XLSX.utils.sheet_to_json<SheetRow>(worksheet);
+    const validationErrors: string[] = [];
 
+    const rawData = XLSX.utils.sheet_to_json<RawRow>(worksheet, { header: 1 });
+    if (rawData.length === 0) {
+      validationErrors.push(`Sheet "${sheetName}" has no data rows.`);
+      setSheetData([]);
+      setColumns([]);
+      setErrors(validationErrors);
+      return;
+    }
+
+    const headerRowIndex = detectHeaderRow(rawData);
+    if (headerRowIndex === -1) {
+      validationErrors.push(
+        "Could not find the data table header row. Ensure the sheet contains the required columns.",
+      );
+      setSheetData([]);
+      setColumns([]);
+      setErrors(validationErrors);
+      return;
+    }
+
+    // Extract month/year from metadata above the header
+    const formattedData = XLSX.utils.sheet_to_json<RawRow>(worksheet, {
+      header: 1,
+      raw: false,
+    });
+    const metaCells = collectMetadataCells(
+      rawData,
+      formattedData,
+      headerRowIndex,
+    );
+    const { month: m, year: y } = extractMonthYearFromCells(metaCells);
+    if (m) setMonth(m);
+    if (y) setYear(y);
+
+    // Parse data from header row
+    const jsonData = XLSX.utils.sheet_to_json<SheetRow>(worksheet, {
+      range: headerRowIndex,
+    });
     if (jsonData.length === 0) {
       validationErrors.push(`Sheet "${sheetName}" has no data rows.`);
       setSheetData([]);
@@ -128,6 +309,7 @@ export default function SalarySlipForm() {
     const fileColumns = Object.keys(jsonData[0]);
     setColumns(fileColumns);
 
+    // Check missing columns
     const missingCols = REQUIRED_COLUMNS.filter(
       (col) =>
         !fileColumns.some((fc) => normalizeCol(fc) === normalizeCol(col)),
@@ -138,95 +320,49 @@ export default function SalarySlipForm() {
       );
     }
 
-    const emptyFieldRows: string[] = [];
-    jsonData.forEach((row, idx) => {
-      REQUIRED_COLUMNS.forEach((col) => {
-        const matchedKey = fileColumns.find(
-          (fc) => normalizeCol(fc) === normalizeCol(col),
-        );
-        if (
-          matchedKey &&
-          (row[matchedKey] === undefined || row[matchedKey] === "")
-        ) {
-          emptyFieldRows.push(`Row ${idx + 2}: "${col}" is empty`);
-        }
-      });
-    });
-    if (emptyFieldRows.length > 0) {
-      validationErrors.push(...emptyFieldRows.slice(0, 10));
-      if (emptyFieldRows.length > 10) {
-        validationErrors.push(
-          `...and ${emptyFieldRows.length - 10} more empty field issues`,
-        );
+    // Validate per-row data
+    const rowIssues = validateRows(jsonData, fileColumns, headerRowIndex);
+    if (rowIssues.length > 0) {
+      validationErrors.push(...rowIssues.slice(0, 10));
+      if (rowIssues.length > 10) {
+        validationErrors.push(`...and ${rowIssues.length - 10} more issues`);
       }
     }
 
-    setSheetData(jsonData.slice(0, 5));
+    setSheetData(jsonData);
+    setSelectedRows(new Set(jsonData.map((_, i) => i)));
     setErrors(validationErrors);
   }, []);
 
-  const validateAndParseFile = useCallback(
+  const parseFile = useCallback(
     (selectedFile: File) => {
-      setErrors([]);
-      setSheetData([]);
-      setColumns([]);
-      setSuccess("");
-      setWorkbook(null);
-      setSheetNames([]);
-
-      const validationErrors: string[] = [];
+      resetState();
 
       const ext = selectedFile.name.split(".").pop()?.toLowerCase();
       if (ext !== "xlsx" && ext !== "xls") {
-        validationErrors.push(
+        setErrors([
           "Invalid file type. Only .xlsx and .xls files are accepted.",
-        );
-        setErrors(validationErrors);
+        ]);
         return;
       }
-
       if (selectedFile.size > MAX_FILE_SIZE_MB * 1048576) {
-        validationErrors.push(
-          `File size exceeds ${MAX_FILE_SIZE_MB} MB limit.`,
-        );
-        setErrors(validationErrors);
+        setErrors([`File size exceeds ${MAX_FILE_SIZE_MB} MB limit.`]);
         return;
       }
 
       setFile(selectedFile);
-
-      // Try to extract month & year from filename
-      const { month: extractedMonth, year: extractedYear } = extractMonthYear(
-        selectedFile.name,
-      );
-      if (extractedMonth) {
-        setMonth(extractedMonth);
-        setMonthAutoDetected(true);
-      } else {
-        setMonth("");
-        setMonthAutoDetected(false);
-      }
-      if (extractedYear) {
-        setYear(extractedYear);
-        setYearAutoDetected(true);
-      } else {
-        setYear("");
-        setYearAutoDetected(false);
-      }
 
       const reader = new FileReader();
       reader.onload = (e) => {
         try {
           const data = new Uint8Array(e.target?.result as ArrayBuffer);
           const wb = XLSX.read(data, { type: "array" });
-          setWorkbook(wb);
-          setSheetNames(wb.SheetNames);
+          setSheetCount(wb.SheetNames.length);
 
           const salarySheet = wb.SheetNames.find((name) =>
             SALARY_SHEET_KEYWORDS.some((kw) => name.toLowerCase().includes(kw)),
           );
-          const autoSheet = salarySheet || wb.SheetNames[0];
-          validateSheet(wb, autoSheet);
+          validateSheet(wb, salarySheet || wb.SheetNames[0]);
         } catch {
           setErrors([
             "Failed to parse the Excel file. Please ensure it is a valid .xlsx/.xls file.",
@@ -236,7 +372,7 @@ export default function SalarySlipForm() {
       };
       reader.readAsArrayBuffer(selectedFile);
     },
-    [validateSheet],
+    [resetState, validateSheet],
   );
 
   /* ── Drag / file handlers ───────────────────────────── */
@@ -246,39 +382,24 @@ export default function SalarySlipForm() {
       e.preventDefault();
       setDragging(false);
       const droppedFile = e.dataTransfer.files[0];
-      if (droppedFile) validateAndParseFile(droppedFile);
+      if (droppedFile) parseFile(droppedFile);
     },
-    [validateAndParseFile],
+    [parseFile],
   );
 
   const handleFileSelect = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
       const selected = e.target.files?.[0];
-      if (selected) validateAndParseFile(selected);
+      if (selected) parseFile(selected);
       e.target.value = "";
     },
-    [validateAndParseFile],
+    [parseFile],
   );
 
-  const removeFile = useCallback(() => {
-    setFile(null);
-    setWorkbook(null);
-    setSheetNames([]);
-    setSheetData([]);
-    setColumns([]);
-    setErrors([]);
-    setSuccess("");
-    setProgress("");
-    setMonth("");
-    setYear("");
-    setMonthAutoDetected(false);
-    setYearAutoDetected(false);
-  }, []);
-
-  /* ── Submit (calls our own API route, NOT the webhook) ─ */
+  /* ── Submit ─────────────────────────────────────────── */
 
   const handleSubmit = useCallback(async () => {
-    if (!file) return;
+    if (!file || selectedRows.size === 0) return;
 
     setLoading(true);
     setErrors([]);
@@ -286,18 +407,28 @@ export default function SalarySlipForm() {
     setProgress("Sending to server...");
 
     try {
-      const params = new URLSearchParams({ month, year });
-      const response = await fetch(
-        `/api/generate-salary-slip?${params.toString()}`,
-        {
-          method: "POST",
-          body: file,
-          headers: {
-            "Content-Type":
-              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          },
-        },
+      const selectedData = Array.from(selectedRows)
+        .sort((a, b) => a - b)
+        .map((i) => sheetData[i]);
+
+      const srNoCol = findCol(columns, "sr.no.", "srno", "sr.no");
+      const employeeIds = srNoCol
+        ? selectedData
+            .map((row) => String(row[srNoCol] ?? "").trim())
+            .filter(Boolean)
+        : [];
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append(
+        "metadata",
+        JSON.stringify({ month, year, sendMail, employeeIds }),
       );
+
+      const response = await fetch("/api/generate-salary-slip", {
+        method: "POST",
+        body: formData,
+      });
 
       if (!response.ok) {
         const body = await response.json().catch(() => null);
@@ -309,16 +440,7 @@ export default function SalarySlipForm() {
       saveAs(zipBlob, "salary-slips.zip");
 
       setSuccess("Salary slips generated and downloaded!");
-
-      setFile(null);
-      setWorkbook(null);
-      setSheetNames([]);
-      setSheetData([]);
-      setColumns([]);
-      setMonth("");
-      setYear("");
-      setMonthAutoDetected(false);
-      setYearAutoDetected(false);
+      resetState();
     } catch (err) {
       console.error(err);
       setErrors([
@@ -330,9 +452,74 @@ export default function SalarySlipForm() {
       setLoading(false);
       setProgress("");
     }
-  }, [file, month, year]);
+  }, [
+    file,
+    month,
+    year,
+    selectedRows,
+    sendMail,
+    columns,
+    sheetData,
+    resetState,
+  ]);
 
-  const canSubmit = file && errors.length === 0 && !loading && month && year;
+  const canSubmit =
+    file &&
+    errors.length === 0 &&
+    !loading &&
+    month &&
+    year &&
+    selectedRows.size > 0;
+
+  /* ── Derived state ──────────────────────────────────── */
+
+  const nameCol = useMemo(() => findCol(columns, "name"), [columns]);
+  const designationCol = useMemo(
+    () => findCol(columns, "designation"),
+    [columns],
+  );
+  const branchCol = useMemo(() => findCol(columns, "branch"), [columns]);
+
+  const filteredEmployees = useMemo(() => {
+    const items = sheetData.map((row, idx) => ({ row, idx }));
+    if (!searchQuery.trim()) return items;
+    const q = searchQuery.toLowerCase();
+    return items.filter(({ row }) => {
+      const name = nameCol ? String(row[nameCol] ?? "").toLowerCase() : "";
+      const designation = designationCol
+        ? String(row[designationCol] ?? "").toLowerCase()
+        : "";
+      const branch = branchCol
+        ? String(row[branchCol] ?? "").toLowerCase()
+        : "";
+      return name.includes(q) || designation.includes(q) || branch.includes(q);
+    });
+  }, [sheetData, searchQuery, nameCol, designationCol, branchCol]);
+
+  const allFilteredSelected =
+    filteredEmployees.length > 0 &&
+    filteredEmployees.every(({ idx }) => selectedRows.has(idx));
+
+  const toggleRow = useCallback((idx: number) => {
+    setSelectedRows((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  }, []);
+
+  const toggleAllFiltered = useCallback(() => {
+    setSelectedRows((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        filteredEmployees.forEach(({ idx }) => next.delete(idx));
+      } else {
+        filteredEmployees.forEach(({ idx }) => next.add(idx));
+      }
+      return next;
+    });
+  }, [allFilteredSelected, filteredEmployees]);
 
   /* ── Render ─────────────────────────────────────────── */
 
@@ -343,7 +530,7 @@ export default function SalarySlipForm() {
         <h1 className="text-5xl font-bold text-accent mb-10 max-md:text-[28px] max-md:mb-6 max-sm:text-[22px] max-sm:mb-4">
           ZEROTIME SOLUTIONS
         </h1>
-        <h2 className="text-[32px] font-bold text-text-h mb-2 max-md:text-[22px] max-sm:text-lg ">
+        <h2 className="text-[32px] font-bold text-text-h mb-2 max-md:text-[22px] max-sm:text-lg">
           Salary Slip Generator
         </h2>
         <p className="text-[15px] text-text max-md:text-sm">
@@ -410,8 +597,8 @@ export default function SalarySlipForm() {
                 {file.name}
               </p>
               <p className="text-xs text-text mt-0.5">
-                {formatBytes(file.size)} &middot; {sheetNames.length} sheet
-                {sheetNames.length !== 1 ? "s" : ""}
+                {formatBytes(file.size)} &middot; {sheetCount} sheet
+                {sheetCount !== 1 ? "s" : ""}
               </p>
             </div>
           </div>
@@ -419,7 +606,7 @@ export default function SalarySlipForm() {
             className="rounded p-1 text-text text-xl transition-colors hover:bg-black/8 max-sm:self-end"
             onClick={(e) => {
               e.stopPropagation();
-              removeFile();
+              resetState();
             }}
             title="Remove file"
           >
@@ -428,56 +615,22 @@ export default function SalarySlipForm() {
         </div>
       )}
 
-      {/* Month & Year */}
-      {file && (
-        <div className="mt-4 flex gap-4 max-sm:flex-col max-sm:gap-3">
-          <div className="flex-1">
-            <label className="block text-sm font-semibold text-text-h mb-1.5">
-              Month
-              {monthAutoDetected && (
-                <span className="ml-1.5 text-xs font-normal text-accent">
-                  (auto-detected)
-                </span>
-              )}
-            </label>
-            <select
-              value={month}
-              onChange={(e) => {
-                setMonth(e.target.value);
-                setMonthAutoDetected(false);
-              }}
-              className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm text-text-h transition-colors focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent-bg"
-            >
-              <option value="">Select month</option>
-              {MONTHS.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex-1">
-            <label className="block text-sm font-semibold text-text-h mb-1.5">
-              Year
-              {yearAutoDetected && (
-                <span className="ml-1.5 text-xs font-normal text-accent">
-                  (auto-detected)
-                </span>
-              )}
-            </label>
-            <input
-              type="number"
-              min="2020"
-              max="2099"
-              value={year}
-              onChange={(e) => {
-                setYear(e.target.value);
-                setYearAutoDetected(false);
-              }}
-              placeholder="e.g. 2026"
-              className="w-full rounded-lg border border-border bg-white px-3 py-2 text-sm text-text-h transition-colors focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent-bg"
-            />
-          </div>
+      {/* Month & Year (read from sheet metadata) */}
+      {file && month && year && (
+        <div className="mt-4 flex items-center gap-3 rounded-lg bg-code-bg px-4 py-3 text-sm text-text-h">
+          <span className="text-lg">📅</span>
+          <span>
+            Salary period:{" "}
+            <strong>
+              {month} {year}
+            </strong>
+          </span>
+        </div>
+      )}
+      {file && (!month || !year) && (
+        <div className="mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-[#ef4444]">
+          Could not detect month/year from the sheet metadata. Please ensure the
+          sheet has a date (e.g. &quot;Feb-26&quot;) above the data table.
         </div>
       )}
 
@@ -493,16 +646,78 @@ export default function SalarySlipForm() {
         </div>
       )}
 
-      {/* Data preview */}
+      {/* Employee selection table */}
       {sheetData.length > 0 && columns.length > 0 && (
         <div className="mt-6 text-left">
           <h3 className="text-sm font-semibold text-text-h mb-3">
-            Data Preview (first {sheetData.length} rows)
+            Select Employees ({selectedRows.size} of {sheetData.length}{" "}
+            selected)
           </h3>
-          <div className="overflow-x-auto rounded-lg border border-border">
-            <table className="w-full border-collapse text-[13px] max-md:text-xs">
-              <thead>
+
+          {/* Table toolbar: search + send mail toggle */}
+          <div className="flex items-center gap-4 mb-3 max-sm:flex-col max-sm:items-stretch max-sm:gap-2">
+            {/* Search */}
+            <div className="relative flex-1">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text text-sm pointer-events-none">
+                🔍
+              </span>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search by name, designation, or branch..."
+                className="w-full rounded-lg border border-border bg-white pl-9 pr-3 py-2 text-sm text-text-h transition-colors focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent-bg"
+              />
+            </div>
+
+            {/* Send Mail toggle */}
+            <label className="flex items-center gap-2.5 cursor-pointer select-none shrink-0 rounded-lg border border-border px-3 py-2 transition-colors hover:bg-accent-bg">
+              <span className="text-sm font-medium text-text-h whitespace-nowrap">
+                📧 Send Mail
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={sendMail}
+                onClick={() => setSendMail((v) => !v)}
+                className={`relative inline-flex h-5.5 w-10 shrink-0 rounded-full transition-colors duration-200 ${
+                  sendMail ? "bg-accent" : "bg-border"
+                }`}
+              >
+                <span
+                  className={`pointer-events-none inline-block h-4.5 w-4.5 rounded-full bg-white shadow-sm transition-transform duration-200 translate-y-0.5 ${
+                    sendMail ? "translate-x-4.75" : "translate-x-0.5"
+                  }`}
+                />
+              </button>
+            </label>
+          </div>
+
+          {sendMail && (
+            <p className="text-xs text-accent mb-3">
+              Salary slips will be emailed to selected employees after
+              generation.
+            </p>
+          )}
+
+          {/* Table */}
+          <div className="overflow-x-auto rounded-lg border border-border max-h-105 overflow-y-auto">
+            <table className="min-w-max w-full border-collapse text-[13px] max-md:text-xs">
+              <thead className="sticky top-0 z-10">
                 <tr>
+                  <th className="whitespace-nowrap bg-code-bg px-3 py-2 text-left font-semibold text-text-h border-b border-border w-10">
+                    <input
+                      type="checkbox"
+                      checked={allFilteredSelected}
+                      onChange={toggleAllFiltered}
+                      className="accent-accent h-4 w-4 cursor-pointer"
+                      title={
+                        allFilteredSelected
+                          ? "Deselect all visible"
+                          : "Select all visible"
+                      }
+                    />
+                  </th>
                   {columns.map((col) => (
                     <th
                       key={col}
@@ -514,18 +729,46 @@ export default function SalarySlipForm() {
                 </tr>
               </thead>
               <tbody>
-                {sheetData.map((row, i) => (
-                  <tr key={i}>
-                    {columns.map((col) => (
-                      <td
-                        key={col}
-                        className="whitespace-nowrap px-3 py-1.5 text-text border-b border-border last:[&:parent:last-child]:border-b-0"
-                      >
-                        {row[col] !== undefined ? String(row[col]) : ""}
-                      </td>
-                    ))}
+                {filteredEmployees.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={columns.length + 1}
+                      className="px-3 py-6 text-center text-text"
+                    >
+                      No employees match your search.
+                    </td>
                   </tr>
-                ))}
+                ) : (
+                  filteredEmployees.map(({ row, idx }) => (
+                    <tr
+                      key={idx}
+                      className={`cursor-pointer transition-colors ${
+                        selectedRows.has(idx)
+                          ? "bg-accent-bg"
+                          : "hover:bg-code-bg"
+                      }`}
+                      onClick={() => toggleRow(idx)}
+                    >
+                      <td className="px-3 py-1.5 border-b border-border w-10">
+                        <input
+                          type="checkbox"
+                          checked={selectedRows.has(idx)}
+                          onChange={() => toggleRow(idx)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="accent-accent h-4 w-4 cursor-pointer"
+                        />
+                      </td>
+                      {columns.map((col) => (
+                        <td
+                          key={col}
+                          className="whitespace-nowrap px-3 py-1.5 text-text border-b border-border"
+                        >
+                          {row[col] !== undefined ? String(row[col]) : ""}
+                        </td>
+                      ))}
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -551,7 +794,7 @@ export default function SalarySlipForm() {
           )}
           {loading
             ? progress || "Generating..."
-            : "Generate & Download Salary Slips"}
+            : `Generate${sendMail ? " & Mail" : ""} Salary Slips (${selectedRows.size})`}
         </button>
       </div>
     </div>

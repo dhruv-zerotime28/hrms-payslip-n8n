@@ -2,67 +2,80 @@ import { NextRequest, NextResponse } from "next/server";
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB
+const XLSX_MIME =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+interface SlipMetadata {
+  month: string;
+  year: string;
+  sendMail: boolean;
+  employeeIds: string[];
+}
+
+function jsonError(error: string, status: number) {
+  return NextResponse.json({ error }, { status });
+}
 
 export async function POST(request: NextRequest) {
   if (!WEBHOOK_URL || !WEBHOOK_SECRET) {
-    return NextResponse.json(
-      { error: "Server misconfiguration" },
-      { status: 500 },
-    );
+    return jsonError("Server misconfiguration", 500);
   }
 
   const contentType = request.headers.get("content-type") ?? "";
-  if (
-    !contentType.includes(
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ) &&
-    !contentType.includes("application/vnd.ms-excel")
-  ) {
-    return NextResponse.json(
-      { error: "Only Excel files (.xlsx / .xls) are accepted" },
-      { status: 400 },
-    );
+  if (!contentType.includes("multipart/form-data")) {
+    return jsonError("Expected multipart/form-data", 400);
   }
 
-  const { searchParams } = new URL(request.url);
-  const month = searchParams.get("month");
-  const year = searchParams.get("year");
+  const formData = await request.formData();
+  const file = formData.get("file");
+  const metadataRaw = formData.get("metadata");
 
-  if (!month || !year) {
-    return NextResponse.json(
-      { error: "month and year query parameters are required" },
-      { status: 400 },
-    );
+  if (!(file instanceof Blob)) return jsonError("Missing file in request", 400);
+  if (typeof metadataRaw !== "string")
+    return jsonError("Missing metadata in request", 400);
+
+  let metadata: SlipMetadata;
+  try {
+    metadata = JSON.parse(metadataRaw);
+  } catch {
+    return jsonError("Invalid metadata JSON", 400);
   }
 
-  const body = await request.arrayBuffer();
+  const { month, year, sendMail, employeeIds } = metadata;
+  if (!month || !year)
+    return jsonError("month and year are required in metadata", 400);
 
-  const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
-  if (body.byteLength > MAX_SIZE) {
-    return NextResponse.json(
-      { error: "File exceeds 5 MB limit" },
-      { status: 413 },
-    );
+  const fileBuffer = await file.arrayBuffer();
+  if (fileBuffer.byteLength > MAX_FILE_SIZE) {
+    return jsonError("File exceeds 5 MB limit", 413);
   }
 
-  const webhookUrl = new URL(WEBHOOK_URL);
-  webhookUrl.searchParams.set("month", month);
-  webhookUrl.searchParams.set("year", year);
+  // Forward to webhook as multipart/form-data
+  const webhookFormData = new FormData();
+  webhookFormData.append(
+    "file",
+    new Blob([fileBuffer], { type: XLSX_MIME }),
+    "salary.xlsx",
+  );
+  webhookFormData.append(
+    "metaData",
+    JSON.stringify({
+      month,
+      year,
+      sendMail: !!sendMail,
+      employeeIds: employeeIds ?? [],
+    }),
+  );
 
-  const webhookResponse = await fetch(webhookUrl.toString(), {
+  const webhookResponse = await fetch(WEBHOOK_URL, {
     method: "POST",
-    headers: {
-      SalarySlipGenerate: WEBHOOK_SECRET,
-      "Content-Type": contentType,
-    },
-    body: body,
+    headers: { SalarySlipGenerate: WEBHOOK_SECRET },
+    body: webhookFormData,
   });
 
   if (!webhookResponse.ok) {
-    return NextResponse.json(
-      { error: `Webhook error: ${webhookResponse.status}` },
-      { status: 502 },
-    );
+    return jsonError(`Webhook error: ${webhookResponse.status}`, 502);
   }
 
   const zipBuffer = await webhookResponse.arrayBuffer();
