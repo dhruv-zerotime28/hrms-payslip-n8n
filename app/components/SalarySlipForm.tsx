@@ -31,7 +31,6 @@ const REQUIRED_COLUMNS = [
   "HRA(calc)",
   "LTA(calc)",
   "Allowance(calc)",
-  "Reb. (OT/ Pending/PL)",
   "Gross",
   "Retention Bonus",
   "PT",
@@ -41,6 +40,7 @@ const REQUIRED_COLUMNS = [
   "Bank A/c No.",
   "IFSC CODE",
   "Emp Mail",
+  "PAN No."
 ];
 
 const SALARY_SHEET_KEYWORDS = ["salary", "sal", "payroll", "wages"];
